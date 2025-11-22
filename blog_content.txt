@@ -1,0 +1,990 @@
+Skip to primary navigation
+Skip to main content
+Skip to footer
+SilectisSilectisSimplifying data engineering, accelerating insights.
+Home
+ 
+Platform
+ 
+How It Works
+ 
+Partners
+ 
+Resources
+ 
+About Us
+ 
+Get a Demo
+Home » Blog » Data Engineering » Tutorial: Creating a Multi-Cloud VPN with Terraform between AWS, GCP, and Azure
+Tutorial: Creating a Multi-Cloud VPN with Terraform between AWS, GCP, and Azure
+At Silectis, we deploy Magpie clusters across AWS, Google Cloud, and Azure. But because some of our internal infrastructure resides only on AWS, we need to establish private connections between these environments so that clusters on Google Cloud and Azure can access those private AWS resources. In this post, we’ll walk through the details of how we set up this multi-cloud network using site-to-site VPN connections in Terraform.
+
+MANAGING CLOUD INFRASTRUCTURE WITH TERRAFORM
+Terraform is a great way to manage cloud infrastructure, allowing engineers to declaratively state a desired infrastructure configuration in code that can be version controlled. AWS, Google, and Azure all have similar offerings, but they are limited to managing resources within their clouds. Since Terraform supports many different cloud infrastructure providers (as well as other providers), it’s a perfect choice for a multi-cloud architecture.
+
+Now is a good time to stop and talk about our desired network architecture. Since AWS is where our shared private resources reside, it will serve as a hub. We can peer other VPCs in AWS with this hub VPC to get access to the private resources, and site-to-site VPNs will connect the other clouds to this AWS hub VPC. Note that each site-to-site VPN connection has two VPN tunnels configured for high availability. AWS will also host DNS that other clouds can access to resolve AWS private hostnames. For this, we’ll use AWS Simple AD. This works for the configuration described here, but for more complicated networks, you may need to run your own DNS. The resulting network looks like this:
+
+Multi-cloud Network Topology.png
+We’ll walk through creating all of this, except for the “resources” in each cloud’s private subnet, using a sample Terraform project hosted here in GitHub. Looking at the Github repository, the root directory has the main Terraform entry point and required variables, as well as a number of modules. There are AWS modules for the directory service and VPC plus Google Cloud and Azure modules for virtual networks. The VPN module contains the infrastructure that connects the 3 networks together.
+
+Multi-cloud Github Project.png
+START BY CONFIGURING THE CSPs IN TERRAFORM
+To begin, we need to configure the various providers in Terraform in the providers.tf file. For simplicity, we will assume a shared credentials file or environment variable authentication for AWS, CLI authentication for Azure, and a service account key file for Google Cloud. Since Google Cloud DNS private forwarding is a beta feature in Google Cloud, we also need to configure the google-beta provider.
+
+terraform {
+  required_providers {
+    aws = "~> 2.39.0"
+
+    google      = "~> 2.18.0"
+    google-beta = "~> 2.18.0"
+
+    azurerm = "~> 1.41.0"
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+provider "google" {
+  credentials = file(pathexpand("~/.config/gcloud/${var.google_project_id}.json"))
+  region      = var.google_region
+  project     = var.google_project_id
+}
+
+provider "google-beta" {
+  credentials = file(pathexpand("~/.config/gcloud/${var.google_project_id}.json"))
+  region      = var.google_region
+  project     = var.google_project_id
+}
+
+provider "azurerm" {}
+view rawproviders.tf hosted with ❤ by GitHub
+Next, we’ll create a simple AWS VPC with one public and one private subnet using the included VPC module. This also configures public and private route tables that will be used in the VPN configuration. 
+
+resource "aws_vpc" "main" {
+  cidr_block = var.cidr_block
+
+  tags = {
+    Name = var.vpc_name
+  }
+}
+
+resource "aws_subnet" "private" {
+  count = var.subnet_count
+
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(var.cidr_block, 4, count.index * 2 + 1)
+
+  tags = {
+    Name = "private-subnet-${count.index}"
+  }
+}
+
+resource "aws_subnet" "public" {
+  count = var.subnet_count
+
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(var.cidr_block, 4, count.index * 2 + 2)
+
+  tags = {
+    Name = "public-subnet-${count.index}"
+  }
+}
+
+resource "aws_network_acl" "public" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = aws_subnet.public[*].id
+
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 80
+    to_port    = 80
+  }
+
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 200
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 443
+    to_port    = 443
+  }
+
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 400
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  ingress {
+    protocol   = "udp"
+    rule_no    = 500
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  ingress {
+    protocol   = -1
+    rule_no    = 1000
+    action     = "allow"
+    cidr_block = aws_vpc.main.cidr_block
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    protocol   = -1
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
+
+  tags = {
+    Name = "public-acl"
+  }
+}
+
+resource "aws_network_acl" "private" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = aws_subnet.private[*].id
+
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 400
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  ingress {
+    protocol   = "udp"
+    rule_no    = 500
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  ingress {
+    protocol   = -1
+    rule_no    = 1000
+    action     = "allow"
+    cidr_block = aws_vpc.main.cidr_block
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    protocol   = -1
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
+
+  tags = {
+    Name = "private-acl"
+  }
+}
+
+# Gateways
+
+resource "aws_internet_gateway" "gw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.vpc_name}-internet-gateway"
+  }
+}
+
+resource "aws_eip" "nat" {
+  vpc = true
+
+  tags = {
+    Name = "nat-elastic-ip"
+  }
+
+  depends_on = [aws_internet_gateway.gw]
+}
+
+resource "aws_nat_gateway" "gw" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+
+  tags = {
+    Name = "${var.vpc_name}-nat-gateway"
+  }
+
+  depends_on = [aws_internet_gateway.gw]
+}
+
+# Route Tables
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "public-route-table"
+  }
+}
+
+resource "aws_route" "public_igw" {
+  route_table_id            = aws_route_table.public.id
+  destination_cidr_block    = "0.0.0.0/0"
+  gateway_id = aws_internet_gateway.gw.id
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "private-route-table"
+  }
+}
+
+resource "aws_route" "private_nat" {
+  route_table_id            = aws_route_table.private.id
+  destination_cidr_block    = "0.0.0.0/0"
+  nat_gateway_id = aws_nat_gateway.gw.id
+}
+
+resource "aws_route_table_association" "public" {
+  count = var.subnet_count
+
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  count = var.subnet_count
+
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+view rawaws-vpn-main.tf hosted with ❤ by GitHub
+Then, we’ll set up the AWS Simple AD service, which we’ll use as a way to share internal DNS records with Azure and Google Cloud. For simplicity here, the module assigns the first two availability zones to the service.
+
+data "aws_vpc" "main" {
+  id = var.vpc_id
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+locals {
+  dns_subnet_availability_zones = slice(data.aws_availability_zones.available.names, 0, 2)
+}
+
+resource "aws_subnet" "dns" {
+  count = length(local.dns_subnet_availability_zones)
+
+  vpc_id            = var.vpc_id
+  cidr_block        = cidrsubnet(var.dns_subnet_cidr_prefix, 4, count.index)
+  availability_zone = local.dns_subnet_availability_zones[count.index]
+
+  tags = {
+    Name = "directory-service-${local.dns_subnet_availability_zones[count.index]}"
+  }
+}
+
+resource "aws_route_table_association" "dns" {
+  count = length(aws_subnet.dns)
+
+  route_table_id = var.private_route_table_id
+  subnet_id      = aws_subnet.dns[count.index].id
+}
+
+resource "aws_network_acl" "dns" {
+  vpc_id     = var.vpc_id
+  subnet_ids = aws_subnet.dns[*].id
+
+  tags = {
+    Name = "directory-service-acl"
+  }
+}
+
+resource "aws_network_acl_rule" "ingress" {
+  network_acl_id = aws_network_acl.dns.id
+
+  egress      = false
+  protocol    = -1
+  rule_number = 100
+  rule_action = "allow"
+  cidr_block  = data.aws_vpc.main.cidr_block
+  from_port   = 0
+  to_port     = 0
+}
+
+resource "aws_network_acl_rule" "egress" {
+  network_acl_id = aws_network_acl.dns.id
+
+  egress      = true
+  protocol    = -1
+  rule_number = 100
+  rule_action = "allow"
+  cidr_block = "0.0.0.0/0"
+  from_port   = 0
+  to_port     = 0
+}
+
+resource "aws_directory_service_directory" "dns" {
+  name        = var.directory_name
+  description = "internal directory for dns forwarding over vpns"
+
+  type = "SimpleAD"
+  size = "Small"
+
+  password = var.directory_password
+
+  vpc_settings {
+    vpc_id     = var.vpc_id
+    subnet_ids = aws_subnet.dns[*].id
+  }
+}
+view rawaws-dns-main.tf hosted with ❤ by GitHub
+Then, we create the Google Compute Network with a single private subnet. Due to the way load balancing works in Google Cloud, we don’t need to create a public subnet. We also configure a private Cloud DNS zone with conditional forwarding to the Simple AD service. This will allow Google Compute instances to resolve internal AWS hostnames. Since this is one-way, AWS instances will not be able to resolve internal Google Cloud hostnames, but Google Cloud DNS supports inbound DNS forwarding if this is a requirement.
+
+resource "google_project_service" "compute" {
+  project = var.project_id
+  service = "compute.googleapis.com"
+}
+
+resource "google_compute_network" "main" {
+  project = google_project_service.compute.project
+
+  name         = var.network_name
+  routing_mode = "GLOBAL"
+
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "private" {
+  count = length(var.regions)
+
+  project = google_project_service.compute.project
+
+  name          = "private-${var.regions[count.index]}"
+  ip_cidr_range = cidrsubnet(var.cidr_block, 4, count.index)
+  region        = var.regions[count.index]
+  network       = google_compute_network.main.self_link
+}
+
+resource "google_compute_router" "nat" {
+  count = length(var.regions)
+
+  project = google_project_service.compute.project
+
+  name    = "${var.regions[count.index]}-nat-router"
+  region  = var.regions[count.index]
+  network = google_compute_network.main.self_link
+}
+
+resource "google_compute_router_nat" "nat" {
+  count = length(var.regions)
+
+  project = google_project_service.compute.project
+
+  name                   = "${var.regions[count.index]}-nat"
+  router                 = google_compute_router.nat[count.index].name
+  region                 = var.regions[count.index]
+  nat_ip_allocate_option = "AUTO_ONLY"
+
+  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+
+  subnetwork {
+    name                    = google_compute_subnetwork.private[count.index].self_link
+    source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
+  }
+}
+
+# allows google instances to resolve aws private domains
+resource "google_dns_managed_zone" "aws" {
+  provider = google-beta
+
+  project = google_project_service.compute.project
+
+  name        = "aws"
+  description = "private dns zone to enable resolving ec2 private domains"
+
+  dns_name = "${var.aws_dns_suffix}."
+
+  visibility = "private"
+
+  private_visibility_config {
+    networks {
+      network_url =  google_compute_network.main.self_link
+    }
+  }
+
+  forwarding_config {
+    target_name_servers {
+      ipv4_address = var.aws_dns_ip_addresses[0]
+    }
+
+    target_name_servers {
+      ipv4_address = var.aws_dns_ip_addresses[1]
+    }
+  }
+}
+view rawgoogle-network-main.tf hosted with ❤ by GitHub
+The Azure Virtual Network is created next with one public and one private subnet, which uses the Simple AD service directly for its DNS servers. While Azure offers a Private DNS, it doesn’t natively support conditional forwarding like Google does, so we need to specify the Simple AD servers as the DNS for the network directly.
+
+resource "azurerm_virtual_network" "network" {
+  name                = var.network_name
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  address_space       = [var.cidr_block]
+  dns_servers         = var.dns_servers
+}
+
+resource "azurerm_subnet" "private" {
+  count = var.subnet_count
+
+  name                 = "private-${count.index}"
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.network.name
+  address_prefix       = cidrsubnet(var.cidr_block, 4, count.index * 2 + 2)
+}
+
+resource "azurerm_subnet" "public" {
+  count = var.subnet_count
+
+  name                 = "public-${count.index}"
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.network.name
+  address_prefix       = cidrsubnet(var.cidr_block, 4, count.index * 2 + 1)
+}
+view rawazure-vnet-main.tf hosted with ❤ by GitHub
+Mind if we keep in touch?
+We’ll occasionally share data engineering resources and best practices, Silectis news and events, and product updates. Just the good stuff — we promise.
+
+
+CONFIGURING SITE-TO-SITE VPNs
+Now that we have each network set up, we can start configuring the site-to-site VPNs. We start in AWS by creating a VPN gateway for the VPC, making sure that VPN routes are propagated from the gateway to the VPC route tables. Then we create two customer gateways with VPN connections, one for Google and one for Azure. For Google, we can use Border Gateway Protocol (BGP) to automatically share routes across the VPN, but for Azure, we need to manually configure the routes. While both AWS and Azure support BGP, the way it needs to be configured on either side of the connection is not currently compatible.
+
+data "aws_vpc" "main" {
+  id = var.aws_vpc_id
+}
+
+resource "aws_vpn_gateway" "main" {
+  vpc_id = data.aws_vpc.main.id
+
+  tags = {
+    Name = "vpn-gateway"
+  }
+}
+
+resource "aws_vpn_gateway_route_propagation" "main" {
+  count = length(var.aws_route_table_ids)
+
+  route_table_id = var.aws_route_table_ids[count.index]
+  vpn_gateway_id = aws_vpn_gateway.main.id
+}
+
+/*
+ * ---------- Google ------------
+ */
+
+resource "aws_customer_gateway" "google" {
+  bgp_asn    = 65000
+  ip_address = google_compute_address.vpn.address
+  type       = "ipsec.1"
+
+  tags = {
+    Name = "google-vpn-customer-gateway"
+  }
+}
+
+resource "aws_vpn_connection" "google" {
+  vpn_gateway_id      = aws_vpn_gateway.main.id
+  customer_gateway_id = aws_customer_gateway.google.id
+  type                = "ipsec.1"
+  static_routes_only  = false
+
+  tags = {
+    Name = "google-vpn-connection"
+  }
+}
+
+/*
+ * ---------- Azure ------------
+ */
+
+resource "aws_customer_gateway" "azure" {
+  bgp_asn    = 65000
+  ip_address = azurerm_public_ip.gateway.ip_address
+  type       = "ipsec.1"
+
+  tags = {
+    Name = "azure-vpn-customer-gateway"
+  }
+}
+
+resource "aws_vpn_connection" "azure" {
+  vpn_gateway_id      = aws_vpn_gateway.main.id
+  customer_gateway_id = aws_customer_gateway.azure.id
+  type                = "ipsec.1"
+  static_routes_only  = true
+
+  tags = {
+    Name = "azure-vpn-connection"
+  }
+}
+
+resource "aws_vpn_connection_route" "azure" {
+  count = length(var.azure_network_address_space)
+
+  vpn_connection_id      = aws_vpn_connection.azure.id
+  destination_cidr_block = var.azure_network_address_space[count.index]
+}
+view rawvpn-aws.tf hosted with ❤ by GitHub
+Configuring the Google side of the VPN connection requires creating a VPN gateway along with two VPN tunnels to AWS and two Cloud Routers. The tunnels send traffic between the networks and the routers manage the traffic and share the available routes using BGP.
+
+locals {
+  google_connection_name = "aws-vpn"
+}
+
+data "google_compute_network" "main" {
+  project = var.google_project_id
+  name    = var.google_network_name
+}
+
+data "google_compute_subnetwork" "subnet" {
+  count = length(var.google_subnet_self_links)
+
+  self_link = var.google_subnet_self_links[count.index]
+}
+
+/*
+ * ----------VPN Connection----------
+ */
+
+resource "google_compute_address" "vpn" {
+  project = var.google_project_id
+  name    = "${local.google_connection_name}-ip"
+  region  = var.google_region
+}
+
+resource "google_compute_vpn_gateway" "aws" {
+  project = var.google_project_id
+  name    = "${local.google_connection_name}-gw-${var.google_region}"
+  network = data.google_compute_network.main.self_link
+  region  = var.google_region
+}
+
+resource "google_compute_forwarding_rule" "esp" {
+  project     = var.google_project_id
+  name        = "fr-esp"
+  ip_protocol = "ESP"
+  ip_address  = google_compute_address.vpn.address
+  target      = google_compute_vpn_gateway.aws.self_link
+}
+
+resource "google_compute_forwarding_rule" "udp500" {
+  project     = var.google_project_id
+  name        = "fr-udp500"
+  ip_protocol = "UDP"
+  port_range  = "500-500"
+  ip_address  = google_compute_address.vpn.address
+  target      = google_compute_vpn_gateway.aws.self_link
+}
+
+resource "google_compute_forwarding_rule" "udp4500" {
+  project     = var.google_project_id
+  name        = "fr-udp4500"
+  ip_protocol = "UDP"
+  port_range  = "4500-4500"
+  ip_address  = google_compute_address.vpn.address
+  target      = google_compute_vpn_gateway.aws.self_link
+}
+
+/*
+ * ---------- VPN Tunnel 1 ----------
+ */
+
+resource "google_compute_vpn_tunnel" "aws1" {
+  project = var.google_project_id
+
+  name          = "${local.google_connection_name}-tunnel1"
+  peer_ip       = aws_vpn_connection.google.tunnel1_address
+  shared_secret = aws_vpn_connection.google.tunnel1_preshared_key
+  ike_version   = 1
+
+  target_vpn_gateway = google_compute_vpn_gateway.aws.self_link
+
+  router = google_compute_router.aws1.self_link
+
+  depends_on = [
+    google_compute_forwarding_rule.esp,
+    google_compute_forwarding_rule.udp500,
+    google_compute_forwarding_rule.udp4500,
+  ]
+}
+
+resource "google_compute_router" "aws1" {
+  project = var.google_project_id
+
+  name    = "${local.google_connection_name}-router1"
+  region  = var.google_region
+  network = data.google_compute_network.main.name
+
+  bgp {
+    asn = aws_customer_gateway.google.bgp_asn
+
+    advertise_mode    = "CUSTOM"
+    advertised_groups = ["ALL_SUBNETS"]
+
+    advertised_ip_ranges {
+      range = var.google_external_dns_cidr
+    }
+  }
+}
+
+resource "google_compute_router_peer" "aws1" {
+  project = var.google_project_id
+
+  name            = "${local.google_connection_name}-bgp1"
+  router          = google_compute_router.aws1.name
+  region          = google_compute_router.aws1.region
+  peer_ip_address = aws_vpn_connection.google.tunnel1_vgw_inside_address
+  peer_asn        = aws_vpn_connection.google.tunnel1_bgp_asn
+  interface       = google_compute_router_interface.aws1.name
+}
+
+resource "google_compute_router_interface" "aws1" {
+  project = var.google_project_id
+
+  name       = "${local.google_connection_name}-interface1"
+  router     = google_compute_router.aws1.name
+  region     = google_compute_router.aws1.region
+  ip_range   = "${aws_vpn_connection.google.tunnel1_cgw_inside_address}/30"
+  vpn_tunnel = google_compute_vpn_tunnel.aws1.name
+}
+
+/*
+ * ---------- VPN Tunnel 2 ----------
+ */
+
+resource "google_compute_vpn_tunnel" "aws2" {
+  project = var.google_project_id
+
+  name          = "${local.google_connection_name}-tunnel2"
+  peer_ip       = aws_vpn_connection.google.tunnel2_address
+  shared_secret = aws_vpn_connection.google.tunnel2_preshared_key
+  ike_version   = 1
+
+  target_vpn_gateway = google_compute_vpn_gateway.aws.self_link
+
+  router = google_compute_router.aws2.name
+
+  depends_on = [
+    google_compute_forwarding_rule.esp,
+    google_compute_forwarding_rule.udp500,
+    google_compute_forwarding_rule.udp4500,
+  ]
+}
+
+resource "google_compute_router" "aws2" {
+  project = var.google_project_id
+
+  name    = "${local.google_connection_name}-router2"
+  region  = var.google_region
+  network = data.google_compute_network.main.name
+
+  bgp {
+    asn = aws_customer_gateway.google.bgp_asn
+
+    advertise_mode    = "CUSTOM"
+    advertised_groups = ["ALL_SUBNETS"]
+
+    advertised_ip_ranges {
+      range = var.google_external_dns_cidr
+    }
+  }
+}
+
+resource "google_compute_router_peer" "aws2" {
+  project = var.google_project_id
+
+  name            = "${local.google_connection_name}-bgp2"
+  router          = google_compute_router.aws2.name
+  region          = google_compute_router.aws2.region
+  peer_ip_address = aws_vpn_connection.google.tunnel2_vgw_inside_address
+  peer_asn        = aws_vpn_connection.google.tunnel2_bgp_asn
+  interface       = google_compute_router_interface.aws2.name
+}
+
+resource "google_compute_router_interface" "aws2" {
+  project = var.google_project_id
+
+  name       = "${local.google_connection_name}-interface2"
+  router     = google_compute_router.aws2.name
+  region     = google_compute_router.aws2.region
+  ip_range   = "${aws_vpn_connection.google.tunnel2_cgw_inside_address}/30"
+  vpn_tunnel = google_compute_vpn_tunnel.aws2.name
+}
+
+/*
+ * ---------- DNS Network ACL Rules ----------
+ */
+
+resource "aws_network_acl_rule" "google_internal_dns_tcp_ingress" {
+  count = length(data.google_compute_subnetwork.subnet)
+
+  network_acl_id = var.dns_network_acl_id
+
+  egress      = false
+  protocol    = "tcp"
+  rule_number = 200 + count.index
+  rule_action = "allow"
+  cidr_block  = data.google_compute_subnetwork.subnet[count.index].ip_cidr_range
+  from_port   = local.dns_port
+  to_port     = local.dns_port
+}
+
+resource "aws_network_acl_rule" "google_internal_dns_udp_ingress" {
+  count = length(data.google_compute_subnetwork.subnet)
+
+  network_acl_id = var.dns_network_acl_id
+
+  egress      = false
+  protocol    = "udp"
+  rule_number = 250 + count.index
+  rule_action = "allow"
+  cidr_block  = data.google_compute_subnetwork.subnet[count.index].ip_cidr_range
+  from_port   = local.dns_port
+  to_port     = local.dns_port
+}
+
+resource "aws_network_acl_rule" "google_external_dns_tcp_ingress" {
+  network_acl_id = var.dns_network_acl_id
+
+  egress      = false
+  protocol    = "tcp"
+  rule_number = 300
+  rule_action = "allow"
+  cidr_block  = var.google_external_dns_cidr
+  from_port   = local.dns_port
+  to_port     = local.dns_port
+}
+
+resource "aws_network_acl_rule" "google_external_dns_udp_ingress" {
+  network_acl_id = var.dns_network_acl_id
+
+  egress      = false
+  protocol    = "udp"
+  rule_number = 301
+  rule_action = "allow"
+  cidr_block  = var.google_external_dns_cidr
+  from_port   = local.dns_port
+  to_port     = local.dns_port
+}
+view rawvpn-google.tf hosted with ❤ by GitHub
+Configuring the Azure side of the VPN is similar to Google. We create a Virtual Network Gateway along with two Local Network Gateways and two corresponding connections (tunnels).
+
+resource "azurerm_subnet" "gateway" {
+  # azure requires this to be named 'GatewaySubnet'
+  name                 = "GatewaySubnet"
+  resource_group_name  = var.azure_resource_group_name
+  virtual_network_name = var.azure_network_name
+  address_prefix       = var.azure_gateway_cidr
+}
+
+resource "azurerm_public_ip" "gateway" {
+  name                = "aws-vpn-gateway-ip"
+  resource_group_name = var.azure_resource_group_name
+  location            = var.azure_location
+  allocation_method   = "Dynamic"
+}
+
+resource "azurerm_virtual_network_gateway" "aws" {
+  name                = "aws-vpn-gateway"
+  resource_group_name = var.azure_resource_group_name
+  location            = var.azure_location
+
+  type     = "Vpn"
+  vpn_type = "RouteBased"
+
+  sku           = var.azure_gateway_sku
+  active_active = false
+  enable_bgp    = false
+
+  ip_configuration {
+    subnet_id            = azurerm_subnet.gateway.id
+    public_ip_address_id = azurerm_public_ip.gateway.id
+  }
+}
+
+/*
+ * ---------- VPN Tunnel 1 ----------
+ */
+
+resource "azurerm_local_network_gateway" "aws1" {
+  name                = "aws-gateway-1"
+  resource_group_name = var.azure_resource_group_name
+  location            = var.azure_location
+
+  gateway_address = aws_vpn_connection.azure.tunnel1_address
+  address_space   = [data.aws_vpc.main.cidr_block]
+}
+
+resource "azurerm_virtual_network_gateway_connection" "aws1" {
+  name                = "aws-connection-1"
+  resource_group_name = var.azure_resource_group_name
+  location            = var.azure_location
+
+  type                       = "IPsec"
+  virtual_network_gateway_id = azurerm_virtual_network_gateway.aws.id
+  local_network_gateway_id   = azurerm_local_network_gateway.aws1.id
+  shared_key                 = aws_vpn_connection.azure.tunnel1_preshared_key
+}
+
+/*
+ * ---------- VPN Tunnel 2 ----------
+ */
+
+resource "azurerm_local_network_gateway" "aws2" {
+  name                = "aws-gateway-2"
+  resource_group_name = var.azure_resource_group_name
+  location            = var.azure_location
+  gateway_address     = aws_vpn_connection.azure.tunnel2_address
+  address_space       = [data.aws_vpc.main.cidr_block]
+}
+
+resource "azurerm_virtual_network_gateway_connection" "aws2" {
+  name                = "aws-connection-2"
+  resource_group_name = var.azure_resource_group_name
+  location            = var.azure_location
+
+  type                       = "IPsec"
+  virtual_network_gateway_id = azurerm_virtual_network_gateway.aws.id
+  local_network_gateway_id   = azurerm_local_network_gateway.aws2.id
+  shared_key                 = aws_vpn_connection.azure.tunnel2_preshared_key
+}
+
+/*
+ * ---------- DNS Network ACL Rules ----------
+ */
+
+resource "aws_network_acl_rule" "azure_dns_tcp_ingress" {
+  count = length(var.azure_network_address_space)
+
+  network_acl_id = var.dns_network_acl_id
+
+  egress      = false
+  protocol    = "tcp"
+  rule_number = 400 + count.index
+  rule_action = "allow"
+  cidr_block  = var.azure_network_address_space[count.index]
+  from_port   = local.dns_port
+  to_port     = local.dns_port
+}
+
+resource "aws_network_acl_rule" "azure_dns_udp_ingress" {
+  count = length(var.azure_network_address_space)
+
+  network_acl_id = var.dns_network_acl_id
+
+  egress      = false
+  protocol    = "udp"
+  rule_number = 450 + count.index
+  rule_action = "allow"
+  cidr_block  = var.azure_network_address_space[count.index]
+  from_port   = local.dns_port
+  to_port     = local.dns_port
+}
+view rawvpn-azure.tf hosted with ❤ by GitHub
+Now we can bring this all together in a main Terraform file that instantiates all of the modules and links them together.
+
+module "aws_vpc" {
+  source = "./aws/vpc"
+
+  vpc_name     = "aws-test"
+  cidr_block   = "10.0.0.0/16"
+  subnet_count = 1
+}
+
+module "dns" {
+  source = "./aws/dns"
+
+  vpc_id                 = module.aws_vpc.vpc_id
+  directory_name         = "test.internal"
+  directory_password     = var.aws_directory_service_password
+  dns_subnet_cidr_prefix = "10.0.0.0/20"
+  private_route_table_id = module.aws_vpc.private_route_table_id
+}
+
+module "google_network" {
+  source = "./google/network"
+
+  project_id   = var.google_project_id
+  network_name = "google-test"
+  cidr_block   = "10.1.0.0/16"
+  regions      = [var.google_region]
+
+  aws_dns_suffix       = var.aws_dns_suffix
+  aws_dns_ip_addresses = module.dns.dns_ip_addresses
+}
+
+module "azure_vnet" {
+  source = "./azure/vnet"
+
+  resource_group_name = var.azure_resource_group_name
+  location            = var.azure_location
+  network_name        = "azure-test"
+  cidr_block          = "10.2.0.0/16"
+  subnet_count        = 1
+  dns_servers         = module.dns.dns_ip_addresses
+}
+
+module "vpn" {
+  source = "./vpn"
+
+  aws_vpc_id          = module.aws_vpc.vpc_id
+  aws_route_table_ids = [module.aws_vpc.private_route_table_id, module.aws_vpc.public_route_table_id]
+
+  google_project_id        = var.google_project_id
+  google_region            = var.google_region
+  google_network_name      = module.google_network.network_name
+  google_subnet_self_links = module.google_network.private_subnet_self_links
+
+  azure_resource_group_name   = var.azure_resource_group_name
+  azure_location              = var.azure_location
+  azure_network_name          = module.azure_vnet.network_name
+  azure_network_address_space = module.azure_vnet.address_space
+  azure_gateway_cidr          = "10.2.0.0/27"
+
+  dns_network_acl_id = module.dns.dns_network_acl_id
+}
+view rawmulti-coud-vpn-main.tf hosted with ❤ by GitHub
+To build the infrastructure, we need to supply the appropriate variable values specified in variables.tf, run terraform init to download the providers and initialize the local modules, and then run terraform apply and confirm the changes. Note that it may take 10-20 minutes after completion for the VPN connections to become active. To test out the connection, deploy an EC2 instance in the AWS private subnet that hosts a web server on a port above 1024 and curl it from an Google compute instance or Azure VM.
+
+Learn more about our cloud-agnostic, multi-cloud enabled Magpie data engineering platform by scheduling a demo. If you’re interested in working on problems like these, apply for one of our open positions on our Careers page.
+
+Jon Lounsbury is the VP of Engineering at Silectis. 
+You can find him on GitHub and LinkedIn.
+
+Footer
+1701 RHODE ISLAND AVE. NW, SECOND FLOOR, WASHINGTON, DC, 20036,
+Email : INFO@SILECT.IS – Phone : (202) 899-6320
+Copyright © 2023 Silectis, Inc. All Rights Reserved. Silectis® is a registered trademark of Silectis, Inc. Unauthorized use is expressly prohibited.
+Apache, Apache Spark, Spark and the Spark logo are trademarks of the Apache Software Foundation.
+
+Privacy Policy
+
+ 
+
